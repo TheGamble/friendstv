@@ -2,8 +2,9 @@
 
 import evdev
 import logging
-from python_vlc_http import HttpVLC
-import time
+import socket
+import os
+import sys
 
 # This is oddly swapped. X is actually the long dimension on the physical screen.
 MAX_X = 480
@@ -11,39 +12,105 @@ MAX_Y = 640
 
 # Defines left/right touch area
 X_MARGIN = 100
-
+Y_MARGIN = 100
 # How far to seek fwd/back
-SEEK_FWD = '+45'
-SEEK_BACK = '-15'
+SEEK_SECS = 30
+
+# Must match MPV's --input-ipc-server flag
+SOCKET_PATH = "/tmp/mpvsocket"
 
 
-# Commands here: https://github.com/MatejMecka/python-vlc-http
+def SendMPV(msg: str):
+    logging.info("MPV command: %s", msg)
+    msg += "\n"
+    try:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(5)
+        client.connect(SOCKET_PATH)
+        sent = client.send(msg.encode())
+        response = client.recv(4096)
+        logging.info(f"Received response: {response.decode().strip()}")
+        client.close()
+    except socket.timeout:
+        logging.error(f"Socket timeout connecting to {SOCKET_PATH}")
+    except FileNotFoundError:
+        logging.error(f"MPV socket not found at {SOCKET_PATH}. Is MPV running with --input-ipc-server?")
+    except Exception as e:
+        logging.error(f"Error communicating with MPV: {e}")
+
+
+# Commands here: https://mpv.io/manual/master/#json-ipc
 def Act(x: int, y: int, delta_x: int, delta_y: int):
-    # Swipe right
-    if delta_x > MAX_X / 2:
-        logging.info("VLC command: playlist-next")
-        controller.next_track()
     # Swipe left
-    elif delta_x < -(MAX_X / 2):
-        logging.info("VLC command: playlist-prev")
-        controller.previous_track()
-    # Right touch
-    elif x > MAX_X - X_MARGIN:
-        logging.info(f"VLC command: seek {SEEK_FWD}")
-        controller.seek(SEEK_FWD)
+    if delta_x < -(MAX_X / 2):
+        SendMPV("playlist-next")
+    # Swipe right
+    elif delta_x > MAX_X / 2:
+        SendMPV("playlist-prev")
+    # Bottom Touch
+    elif y < Y_MARGIN:
+        SendMPV("playlist-next-playlist")
+    # Top Touch
+    elif y > MAX_Y - Y_MARGIN:
+        SendMPV("playlist-prev-playlist")
     # Left touch
     elif x < X_MARGIN:
-        logging.info(f"VLC command: seek {SEEK_BACK}")
-        controller.seek(SEEK_BACK)
+        SendMPV(f"seek {0-SEEK_SECS}")
     # Middle touch
+    elif x > MAX_X - X_MARGIN:
+        SendMPV(f"seek {SEEK_SECS}")
+    # Right touch
     else:
-        logging.info("VLC command: cycle pause")
-        controller.pause()
+        SendMPV("cycle pause")
+
+
+def find_touch_device():
+    """Find the touchscreen input device."""
+    devices = [evdev.InputDevice(path) for path in evdev.list_devices()]
+    
+    for device in devices:
+        # Look for devices with absolute X/Y axes (touchscreens)
+        caps = device.capabilities()
+        if evdev.ecodes.EV_ABS in caps:
+            abs_events = caps[evdev.ecodes.EV_ABS]
+            # Check if it has both X and Y multitouch axes
+            has_mt_x = any(evdev.ecodes.ABS_MT_POSITION_X in event for event in abs_events)
+            has_mt_y = any(evdev.ecodes.ABS_MT_POSITION_Y in event for event in abs_events)
+            
+            if has_mt_x and has_mt_y:
+                logging.info(f"Found touchscreen: {device.name} at {device.path}")
+                return device.path
+    
+    # Fallback to /dev/input/event0
+    logging.warning("Could not auto-detect touchscreen, defaulting to /dev/input/event0")
+    return "/dev/input/event0"
 
 
 def main():
-    logging.getLogger().setLevel(logging.INFO)
-    device = evdev.InputDevice("/dev/input/event0")
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+    
+    # Check if user is in input group
+    if not os.access("/dev/input/event0", os.R_OK):
+        logging.error("ERROR: No read access to /dev/input/event0")
+        logging.error("Please run: sudo usermod -a -G input admin")
+        logging.error("Then log out and log back in.")
+        sys.exit(1)
+    
+    device_path = find_touch_device()
+    
+    try:
+        device = evdev.InputDevice(device_path)
+    except PermissionError:
+        logging.error(f"Permission denied accessing {device_path}")
+        logging.error("Please run: sudo usermod -a -G input admin")
+        sys.exit(1)
+    except FileNotFoundError:
+        logging.error(f"Device not found: {device_path}")
+        sys.exit(1)
+    
     logging.info("Input device: %s", device)
 
     # Key event comes before location event. So assume first key down is in middle of screen
@@ -70,10 +137,6 @@ def main():
             elif event.code == evdev.ecodes.ABS_MT_POSITION_Y:
                 x = MAX_X - event.value
 
-# At one point this sleep was needed to ensure the VLC service has
-# started already, not sure if it still is, but it's not hurting anything
-time.sleep(3)
 
-# The IP and password values here are defined in the start.sh script
-controller = HttpVLC('http://127.0.0.1:9090', '', '1234')
-main()
+if __name__ == "__main__":
+    main()
