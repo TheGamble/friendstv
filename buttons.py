@@ -1,52 +1,73 @@
 #!/usr/bin/python3
 
 import logging
-import RPi.GPIO as GPIO
+from gpiozero import Button
 import time
 import os
+import socket
+import sys
 
+# GPIO pin assignments (BCM numbering - same as original)
+BUTTON_PIN = 26
+
+button = Button(BUTTON_PIN, pull_up=True)
+SOCKET_PATH = "/tmp/mpvsocket"
+
+def SendMPV(msg: str):
+    logging.info("MPV command: %s", msg)
+    msg += "\n"
+    try:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(5)
+        client.connect(SOCKET_PATH)
+        sent = client.send(msg.encode())
+        response = client.recv(4096)
+        logging.info(f"Received response: {response.decode().strip()}")
+        client.close()
+    except socket.timeout:
+        logging.error(f"Socket timeout connecting to {SOCKET_PATH}")
+    except FileNotFoundError:
+        logging.error(f"MPV socket not found at {SOCKET_PATH}. Is MPV running with --input-ipc-server?")
+    except Exception as e:
+        logging.error(f"Error communicating with MPV: {e}")
 
 def turnOnScreen():
     logging.info("turnOnScreen")
-    # Enable audio
-    os.system("raspi-gpio set 19 op a5")
     # Turn on screen backlight
-    GPIO.output(18, GPIO.HIGH)
-
+    os.system("pinctrl set 18 op dh")
+    # Pause MPV
+    SendMPV("set pause no")
 
 def turnOffScreen():
     logging.info("turnOffScreen")
-    # Mute audio
-    os.system("raspi-gpio set 19 ip")
     # Turn off screen backlight
-    GPIO.output(18, GPIO.LOW)
-
+    os.system("pinctrl set 18 op dl")
+    # Resume MPV
+    SendMPV("set pause yes")
 
 def main():
-    logging.getLogger().setLevel(logging.INFO)
+    global button_line, backlight_line
 
-    # Initial GPIO setup
-    GPIO.setmode(GPIO.BCM)
-    # Set pin 26 as input to monitor button press
-    GPIO.setup(26, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-    # Set pin 18 as output to control screen backlight
-    GPIO.setup(18, GPIO.OUT)
+    logging.getLogger().setLevel(logging.INFO)
 
     turnOffScreen()
     screen_on = False
 
-    while True:
-        # If you are having and issue with the button doing the opposite of what you want
-        # IE Turns on when it should be off, change this line to:
-        # input = GPIO.input(26)
-        input = not GPIO.input(26)
-        if input != screen_on:
-            screen_on = input
-            if screen_on:
-                turnOnScreen()
+    try:
+        while True:
+            if button.is_pressed:
+                if screen_on == False:
+                    turnOnScreen()
+                    screen_on = True
             else:
-                turnOffScreen()
-        time.sleep(0.3)
+                if screen_on == True:
+                    turnOffScreen()
+                    screen_on = False
+            time.sleep(0.3)
+    except KeyboardInterrupt:
+        logging.info("Shutting down...")
+    finally:
+        button.close()
 
-
-main()
+if __name__ == "__main__":
+    main()
